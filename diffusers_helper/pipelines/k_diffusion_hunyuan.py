@@ -1,7 +1,7 @@
 import torch
 import math
 
-from diffusers_helper.k_diffusion.uni_pc_fm import sample_unipc
+from diffusers_helper.k_diffusion.uni_pc_fm import sample_unipc, sample_unipc_inpaint
 from diffusers_helper.k_diffusion.wrapper import fm_wrapper
 from diffusers_helper.utils import repeat_to_batch_size
 
@@ -116,5 +116,141 @@ def sample_hunyuan(
         results = sample_unipc(k_model, latents, sigmas, extra_args=sampler_kwargs, disable=False, callback=callback)
     else:
         raise NotImplementedError(f'Sampler {sampler} is not supported.')
+
+    return results
+
+
+@torch.inference_mode()
+def sample_hunyuan_inpaint(
+        transformer,
+        sampler='unipc',
+        width=512,
+        height=512,
+        frames=16,
+        real_guidance_scale=1.0,
+        distilled_guidance_scale=6.0,
+        guidance_rescale=0.0,
+        shift=None,
+        num_inference_steps=25,
+        batch_size=None,
+        generator=None,
+        prompt_embeds=None,
+        prompt_embeds_mask=None,
+        prompt_poolers=None,
+        negative_prompt_embeds=None,
+        negative_prompt_embeds_mask=None,
+        negative_prompt_poolers=None,
+        dtype=torch.bfloat16,
+        device=None,
+        negative_kwargs=None,
+        callback=None,
+        # Inpainting specific parameters
+        original_latents=None,
+        inpaint_mask=None,
+        inpaint_strength=1.0,
+        **kwargs,
+):
+    """Sample with inpainting support.
+
+    Args:
+        original_latents: The latent representation of the original video [B, C, T, H, W]
+        inpaint_mask: Mask tensor [B, 1, T, H, W] where 1=inpaint (generate), 0=keep original
+        inpaint_strength: How much to inpaint (1.0=full inpainting, 0.0=no inpainting)
+    """
+    device = device or transformer.device
+
+    if batch_size is None:
+        batch_size = int(prompt_embeds.shape[0])
+
+    latent_frames = (frames + 3) // 4
+    latents = torch.randn((batch_size, 16, latent_frames, height // 8, width // 8), generator=generator, device=generator.device).to(device=device, dtype=torch.float32)
+
+    B, C, T, H, W = latents.shape
+    seq_length = T * H * W // 4
+
+    if shift is None:
+        mu = calculate_flux_mu(seq_length, exp_max=7.0)
+    else:
+        mu = math.log(shift)
+
+    sigmas = get_flux_sigmas_from_mu(num_inference_steps, mu).to(device)
+
+    # Apply inpaint_strength to sigmas (start from a partially noised state)
+    if inpaint_strength < 1.0:
+        # Find the starting sigma index based on strength
+        start_idx = int((1.0 - inpaint_strength) * num_inference_steps)
+        sigmas = sigmas[start_idx:]
+
+        if original_latents is not None:
+            # Initialize latents from original with appropriate noise
+            first_sigma = sigmas[0].to(device=device, dtype=torch.float32)
+            original_latents = original_latents.to(device=device, dtype=torch.float32)
+            latents = original_latents * (1.0 - first_sigma) + latents * first_sigma
+
+    k_model = fm_wrapper(transformer)
+
+    distilled_guidance = torch.tensor([distilled_guidance_scale * 1000.0] * batch_size).to(device=device, dtype=dtype)
+
+    prompt_embeds = repeat_to_batch_size(prompt_embeds, batch_size)
+    prompt_embeds_mask = repeat_to_batch_size(prompt_embeds_mask, batch_size)
+    prompt_poolers = repeat_to_batch_size(prompt_poolers, batch_size)
+    negative_prompt_embeds = repeat_to_batch_size(negative_prompt_embeds, batch_size)
+    negative_prompt_embeds_mask = repeat_to_batch_size(negative_prompt_embeds_mask, batch_size)
+    negative_prompt_poolers = repeat_to_batch_size(negative_prompt_poolers, batch_size)
+
+    # Prepare inpainting mask
+    if inpaint_mask is not None:
+        inpaint_mask = inpaint_mask.to(device=device, dtype=torch.float32)
+        # Ensure mask has correct shape [B, 1, T, H, W] or broadcast
+        if inpaint_mask.shape[2] != T:
+            inpaint_mask = torch.nn.functional.interpolate(
+                inpaint_mask,
+                size=(T, H, W),
+                mode='trilinear',
+                align_corners=False
+            )
+
+    if original_latents is not None:
+        original_latents = original_latents.to(device=device, dtype=torch.float32)
+        if original_latents.shape[2] != T:
+            original_latents = torch.nn.functional.interpolate(
+                original_latents,
+                size=(T, H, W),
+                mode='trilinear',
+                align_corners=False
+            )
+
+    sampler_kwargs = dict(
+        dtype=dtype,
+        cfg_scale=real_guidance_scale,
+        cfg_rescale=guidance_rescale,
+        concat_latent=None,
+        positive=dict(
+            pooled_projections=prompt_poolers,
+            encoder_hidden_states=prompt_embeds,
+            encoder_attention_mask=prompt_embeds_mask,
+            guidance=distilled_guidance,
+            **kwargs,
+        ),
+        negative=dict(
+            pooled_projections=negative_prompt_poolers,
+            encoder_hidden_states=negative_prompt_embeds,
+            encoder_attention_mask=negative_prompt_embeds_mask,
+            guidance=distilled_guidance,
+            **(kwargs if negative_kwargs is None else {**kwargs, **negative_kwargs}),
+        )
+    )
+
+    if sampler == 'unipc':
+        results = sample_unipc_inpaint(
+            k_model, latents, sigmas,
+            extra_args=sampler_kwargs,
+            disable=False,
+            callback=callback,
+            original_latents=original_latents,
+            inpaint_mask=inpaint_mask,
+        )
+    else:
+        raise NotImplementedError(f'Sampler {sampler} is not supported for inpainting.')
 
     return results

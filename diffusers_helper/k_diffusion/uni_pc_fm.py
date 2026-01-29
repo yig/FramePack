@@ -139,3 +139,96 @@ class FlowMatchUniPC:
 def sample_unipc(model, noise, sigmas, extra_args=None, callback=None, disable=False, variant='bh1'):
     assert variant in ['bh1', 'bh2']
     return FlowMatchUniPC(model, extra_args=extra_args, variant=variant).sample(noise, sigmas=sigmas, callback=callback, disable_pbar=disable)
+
+
+class FlowMatchUniPCInpaint(FlowMatchUniPC):
+    """FlowMatchUniPC with inpainting support."""
+
+    def __init__(self, model, extra_args, variant='bh1', original_latents=None, inpaint_mask=None):
+        super().__init__(model, extra_args, variant)
+        self.original_latents = original_latents
+        self.inpaint_mask = inpaint_mask
+        # Store consistent noise for the unmasked regions
+        self.consistent_noise = None
+        if original_latents is not None:
+            self.consistent_noise = torch.randn_like(original_latents)
+
+    def apply_inpaint_mask(self, x, sigma):
+        """Apply inpainting mask to blend generated content with original.
+
+        At each denoising step, we keep the unmasked regions from the
+        noisy version of the original latents at the current sigma level.
+        """
+        if self.original_latents is None or self.inpaint_mask is None:
+            return x
+
+        # Ensure all tensors are on the same device
+        device = x.device
+        original_latents = self.original_latents.to(device)
+        inpaint_mask = self.inpaint_mask.to(device)
+        consistent_noise = self.consistent_noise.to(device)
+
+        # Create noisy version of original at current sigma level
+        # For flow matching: x_t = (1 - sigma) * x_0 + sigma * noise
+        # Use consistent noise to avoid flickering in unmasked regions
+        sigma_expanded = expand_dims(sigma, original_latents.dim())
+        noisy_original = (1.0 - sigma_expanded) * original_latents + sigma_expanded * consistent_noise
+
+        # Blend: mask=1 means inpaint (use generated), mask=0 means keep original
+        x = inpaint_mask * x + (1.0 - inpaint_mask) * noisy_original
+
+        return x
+
+    def sample(self, x, sigmas, callback=None, disable_pbar=False):
+        order = min(3, len(sigmas) - 2)
+        model_prev_list, t_prev_list = [], []
+
+        for i in trange(len(sigmas) - 1, disable=disable_pbar):
+            vec_t = sigmas[i].expand(x.shape[0])
+
+            # Apply inpainting mask at the beginning of each step
+            x = self.apply_inpaint_mask(x, vec_t)
+
+            if i == 0:
+                model_prev_list = [self.model_fn(x, vec_t)]
+                t_prev_list = [vec_t]
+            elif i < order:
+                init_order = i
+                x, model_x = self.update_fn(x, model_prev_list, t_prev_list, vec_t, init_order)
+                model_prev_list.append(model_x)
+                t_prev_list.append(vec_t)
+            else:
+                x, model_x = self.update_fn(x, model_prev_list, t_prev_list, vec_t, order)
+                model_prev_list.append(model_x)
+                t_prev_list.append(vec_t)
+
+            model_prev_list = model_prev_list[-order:]
+            t_prev_list = t_prev_list[-order:]
+
+            if callback is not None:
+                callback({'x': x, 'i': i, 'denoised': model_prev_list[-1]})
+
+        # Final blend with original for unmasked regions (at sigma=0)
+        final_result = model_prev_list[-1]
+        if self.original_latents is not None and self.inpaint_mask is not None:
+            device = final_result.device
+            original_latents = self.original_latents.to(device)
+            inpaint_mask = self.inpaint_mask.to(device)
+            final_result = inpaint_mask * final_result + (1.0 - inpaint_mask) * original_latents
+
+        return final_result
+
+
+def sample_unipc_inpaint(model, noise, sigmas, extra_args=None, callback=None, disable=False, variant='bh1',
+                         original_latents=None, inpaint_mask=None):
+    """Sample with inpainting support.
+
+    Args:
+        original_latents: The latent representation of the original video
+        inpaint_mask: Mask tensor where 1=inpaint (generate), 0=keep original
+    """
+    assert variant in ['bh1', 'bh2']
+    return FlowMatchUniPCInpaint(
+        model, extra_args=extra_args, variant=variant,
+        original_latents=original_latents, inpaint_mask=inpaint_mask
+    ).sample(noise, sigmas=sigmas, callback=callback, disable_pbar=disable)
