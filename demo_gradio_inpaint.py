@@ -21,7 +21,7 @@ from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode
 from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan, sample_hunyuan_inpaint
-from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
+from diffusers_helper.memory import cpu, gpu, GPU_TYPE, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
 from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from transformers import SiglipImageProcessor, SiglipVisionModel
@@ -38,10 +38,23 @@ args = parser.parse_args()
 
 print(args)
 
-free_mem_gb = get_cuda_free_memory_gb(gpu)
-high_vram = free_mem_gb > 60
+print(f'GPU Type: {GPU_TYPE}')
+print(f'GPU Device: {gpu}')
 
-print(f'Free VRAM {free_mem_gb} GB')
+if GPU_TYPE == 'cuda':
+    free_mem_gb = get_cuda_free_memory_gb(gpu)
+    high_vram = free_mem_gb > 60
+    print(f'Free VRAM {free_mem_gb} GB')
+elif GPU_TYPE == 'mps':
+    # MPS uses unified memory, conservative mode recommended
+    free_mem_gb = 16.0  # Assume reasonable unified memory
+    high_vram = False  # Use memory-efficient mode on MPS
+    print(f'MPS unified memory mode (conservative)')
+else:
+    free_mem_gb = 0
+    high_vram = False
+    print('No GPU available, using CPU')
+
 print(f'High-VRAM Mode: {high_vram}')
 
 text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
@@ -53,7 +66,9 @@ vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanV
 feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
 image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
 
-transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
+# MPS has limited bfloat16 support, use float16 instead
+_transformer_load_dtype = torch.float16 if (torch.backends.mps.is_available() and not torch.cuda.is_available()) else torch.bfloat16
+transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=_transformer_load_dtype).cpu()
 
 vae.eval()
 text_encoder.eval()
@@ -68,7 +83,15 @@ if not high_vram:
 transformer.high_quality_fp32_output_for_inference = True
 print('transformer.high_quality_fp32_output_for_inference = True')
 
-transformer.to(dtype=torch.bfloat16)
+# MPS has limited bfloat16 support, use float16 instead
+if GPU_TYPE == 'mps':
+    transformer_dtype = torch.float16
+    print('Using float16 for transformer (MPS compatibility)')
+else:
+    transformer_dtype = torch.bfloat16
+    print('Using bfloat16 for transformer')
+
+transformer.to(dtype=transformer_dtype)
 vae.to(dtype=torch.float16)
 image_encoder.to(dtype=torch.float16)
 text_encoder.to(dtype=torch.float16)
@@ -360,7 +383,7 @@ def worker(input_video, mask_video, prompt, n_prompt, seed, steps, cfg, gs, rs, 
             negative_prompt_embeds_mask=llama_attention_mask_n,
             negative_prompt_poolers=clip_l_pooler_n,
             device=gpu,
-            dtype=torch.bfloat16,
+            dtype=transformer.dtype,
             image_embeddings=image_encoder_last_hidden_state,
             # Inpainting specific
             original_latents=video_latents,
