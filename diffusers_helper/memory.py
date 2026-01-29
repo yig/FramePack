@@ -5,7 +5,17 @@ import torch
 
 
 cpu = torch.device('cpu')
-gpu = torch.device(f'cuda:{torch.cuda.current_device()}')
+
+# Device detection: prefer CUDA, fall back to MPS, then CPU
+if torch.cuda.is_available():
+    gpu = torch.device(f'cuda:{torch.cuda.current_device()}')
+    GPU_TYPE = 'cuda'
+elif torch.backends.mps.is_available():
+    gpu = torch.device('mps')
+    GPU_TYPE = 'mps'
+else:
+    gpu = cpu
+    GPU_TYPE = 'cpu'
 gpu_complete_modules = []
 
 
@@ -72,13 +82,22 @@ def get_cuda_free_memory_gb(device=None):
     if device is None:
         device = gpu
 
-    memory_stats = torch.cuda.memory_stats(device)
-    bytes_active = memory_stats['active_bytes.all.current']
-    bytes_reserved = memory_stats['reserved_bytes.all.current']
-    bytes_free_cuda, _ = torch.cuda.mem_get_info(device)
-    bytes_inactive_reserved = bytes_reserved - bytes_active
-    bytes_total_available = bytes_free_cuda + bytes_inactive_reserved
-    return bytes_total_available / (1024 ** 3)
+    if GPU_TYPE == 'cuda':
+        memory_stats = torch.cuda.memory_stats(device)
+        bytes_active = memory_stats['active_bytes.all.current']
+        bytes_reserved = memory_stats['reserved_bytes.all.current']
+        bytes_free_cuda, _ = torch.cuda.mem_get_info(device)
+        bytes_inactive_reserved = bytes_reserved - bytes_active
+        bytes_total_available = bytes_free_cuda + bytes_inactive_reserved
+        return bytes_total_available / (1024 ** 3)
+    elif GPU_TYPE == 'mps':
+        # MPS doesn't provide detailed memory stats like CUDA
+        # Return a reasonable default to allow the code to proceed
+        # On Apple Silicon, unified memory is typically 8-128GB
+        # We return a conservative estimate
+        return 16.0  # Assume 16GB available by default for MPS
+    else:
+        return 0.0
 
 
 def move_model_to_device_with_memory_preservation(model, target_device, preserved_memory_gb=0):
